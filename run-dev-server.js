@@ -319,6 +319,14 @@ if (backendHost) {
         "a Wrangler --port override.");
   }
 }
+
+// Wrangler binds 127.0.0.1 by default, which is fine for a laptop but useless when the dev
+// server runs inside a container (k3s, docker) where the Service must reach the pod. Set
+// WRANGLER_DEV_IP=0.0.0.0 to listen on all interfaces.
+if (process.env.WRANGLER_DEV_IP) {
+  args.push("--ip", process.env.WRANGLER_DEV_IP);
+}
+
 console.log(`\nStarting: wrangler dev ${args.join(" ")}\n`);
 
 try {
