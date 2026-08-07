@@ -78,7 +78,14 @@ function findGatekeepers(parentDir) {
   }
 }
 
-const gatekeepers = findGatekeepers(PACKAGES_DIR);
+// Containerized deployments can restrict which gatekeepers boot — every gatekeeper is a
+// separate workerd isolate, so each one costs memory (16 of them exceed ~3Gi on a small
+// node). GATEKEEPERS is a comma-separated allowlist of package names (e.g.
+// GATEKEEPERS=context,homeassistant,mcp,scheduler); unset/empty keeps all of them.
+const gatekeeperAllowlist = (process.env.GATEKEEPERS ?? "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+const gatekeepers = findGatekeepers(PACKAGES_DIR)
+    .filter(gk => gatekeeperAllowlist.length === 0 || gatekeeperAllowlist.includes(gk.name));
 
 // The Context Library (packages/gatekeeper-context) is discovered by findGatekeepers and bound
 // like any other gatekeeper (GATEKEEPER_CONTEXT -> GatekeeperVendor). Its describe() reports
