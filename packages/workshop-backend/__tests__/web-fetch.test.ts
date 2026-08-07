@@ -109,6 +109,17 @@ describe("webFetch document conversion", () => {
     expect(result.body).toBe("# Title\n\nBody");
   });
 
+  it("falls back to raw bytes when there is no Workers AI binding", async () => {
+    mockResponse("<h1>Title</h1><p>Body</p>", "text/html; charset=utf-8");
+
+    // Self-hosted deployments may have no WORKERS_AI binding at all; webFetch must not
+    // throw, it just returns the undecoded document text.
+    const env: WebFetchEnv = { gateway: null };
+
+    const result = await webFetch(env, { url: "https://example.com/page" });
+    expect(result.body).toContain("<h1>Title</h1>");
+  });
+
   it("passes a same-account AI gateway to toMarkdown", async () => {
     mockResponse("<h1>Title</h1>", "text/html");
 
