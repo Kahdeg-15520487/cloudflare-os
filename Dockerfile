@@ -41,6 +41,16 @@ RUN pnpm --filter @gadgets/typed-storage build \
  && pnpm --filter @gadgets/workshop-backend run build:worker \
  && for d in packages/gatekeeper-*; do (cd "$d" && pnpm exec capnweb-validate build --out .wrangler/validate); done
 
+# Gatekeeper UI bundles (configurator modules + single-file app bundles). The dev server
+# normally builds these at startup via watchers; pre-build them here and skip at runtime
+# (SKIP_GATEKEEPER_UI_BUILDS=true) to avoid a ~1GB startup memory spike in the pod.
+RUN for d in packages/gatekeeper-*/src/configurator; do \
+      [ -d "$d" ] && node scripts/build-gatekeeper-configurator.mjs "${d%/src/configurator}" --quiet; \
+    done \
+ && for f in packages/gatekeeper-*/build-app.mjs; do \
+      [ -f "$f" ] && (cd "$(dirname "$f")" && node build-app.mjs); \
+    done
+
 # Pre-warm the Chrome used by the Browser Run emulation. Miniflare installs it into
 # wrangler's global cache dir (xdg cache for ".wrangler": $XDG_CACHE_HOME/.wrangler),
 # NOT PUPPETEER_CACHE_DIR. Resolve @puppeteer/browsers through the installed dependency
@@ -67,6 +77,7 @@ EXPOSE 8787
 # it (wrangler defaults to loopback). Patch carried on the feat/selfhost-k3s branch.
 ENV WRANGLER_DEV_IP=0.0.0.0 \
     WRANGLER_SEND_METRICS=false \
+    SKIP_GATEKEEPER_UI_BUILDS=true \
     XDG_CACHE_HOME=/opt/cfos-cache
 
 CMD ["node", "run-dev-server.js", "--serve-frontend-assets"]

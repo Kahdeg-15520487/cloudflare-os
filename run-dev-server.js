@@ -101,7 +101,15 @@ function spawnDevWatcher(label, command, args) {
   devWatchers.push(watcher);
 }
 
+// Containerized deployments (k8s) pre-build the gatekeeper UI bundles into the image and
+// gain nothing from file watching; running these builds at startup (vite/esbuild) spikes
+// memory ~1GB on top of the 18 workers and can OOM small pods.
+// SKIP_GATEKEEPER_UI_BUILDS=true skips the initial builds and the watchers entirely.
+const skipGatekeeperUiBuilds = process.env.SKIP_GATEKEEPER_UI_BUILDS === "true";
+
 for (const gk of gatekeepers) {
+  if (skipGatekeeperUiBuilds) continue;
+
   // Configurator UI (compiled by build-gatekeeper-configurator.mjs).
   if (existsSync(join(gk.dir, "src", "configurator"))) {
     const script = join(ROOT, "scripts", "build-gatekeeper-configurator.mjs");
