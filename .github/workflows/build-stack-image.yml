@@ -1,17 +1,18 @@
 # Builds the self-hosted Cloudflare OS stack image and publishes it to GHCR.
 #
-# The k3s deployment (k3s_lab repo, cloudflare-os/) pulls ghcr.io/kahdeg-15520487/cloudflare-os:latest
-# with imagePullPolicy: Always, so a push to any branch here rolls the cluster pod after
-# rollout restart. The `sha-<7>` tag provides a stable handle for rollbacks.
-#
-# Note: the WRANGLER_DEV_IP + webFetch-fallback patches live on feat/selfhost-k3s; merge that
-# branch to `main` so main-branch builds carry them too.
+# The k8s Deployment (k3s_lab repo, cloudflare-os/) pins an immutable
+# ghcr.io/kahdeg-15520487/cloudflare-os:sha-<7> tag; bumping it is a manual commit to
+# k3s_lab — ArgoCD (which watches git) then syncs and rolls the pod.
 name: build-stack-image
 
 on:
   push:
     branches: ["feat/selfhost-k3s"]
   workflow_dispatch:
+
+concurrency:
+  group: build-stack-image
+  cancel-in-progress: false
 
 jobs:
   build:
