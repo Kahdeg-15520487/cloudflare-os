@@ -46,16 +46,16 @@ RUN pnpm --filter @gadgets/typed-storage build \
 # NOT PUPPETEER_CACHE_DIR. Resolve @puppeteer/browsers through the installed dependency
 # graph (it is miniflare's dep, not hoisted to the root).
 ENV XDG_CACHE_HOME=/opt/cfos-cache
-RUN node -e '
-    const path = require("path");
-    const os = require("os");
-    const mf = require.resolve("miniflare/package.json", { paths: ["."] });
-    const pb = require.resolve("@puppeteer/browsers/package.json", { paths: [path.dirname(mf)] });
-    const { install } = require(pb);
-    const cacheDir = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), ".wrangler");
-    install({ browser: "chrome", buildId: "126.0.6478.182", cacheDir, platform: process.platform })
-      .then(() => console.log("Chrome pre-warmed at", cacheDir))
-      .catch((e) => { console.error(e); process.exit(1); });
+RUN node -e '\
+    const path = require("path");\
+    const os = require("os");\
+    const mf = require.resolve("miniflare/package.json", { paths: ["."] });\
+    const pb = require.resolve("@puppeteer/browsers/package.json", { paths: [path.dirname(mf)] });\
+    const { install } = require(pb);\
+    const cacheDir = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), ".wrangler");\
+    install({ browser: "chrome", buildId: "126.0.6478.182", cacheDir, platform: process.platform })\
+      .then(() => console.log("Chrome pre-warmed at", cacheDir))\
+      .catch((e) => { console.error(e); process.exit(1); });\
     '
 
 EXPOSE 8787
