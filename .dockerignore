@@ -1,0 +1,13 @@
+# Docker build context hygiene for the self-hosted stack image (k8s/cloudflare-os/Dockerfile).
+# Keeps the image lean and avoids stale host artifacts. Everything excluded here is either
+# recreated by builds or generated at runtime by run-dev-server.js.
+
+node_modules
+.git
+.wrangler
+dist
+*.tsbuildinfo
+.run-local-stamp
+.dev.vars*
+wrangler.dev.jsonc
+**/wrangler.dev.jsonc
