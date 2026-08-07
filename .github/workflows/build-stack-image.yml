@@ -10,7 +10,7 @@ name: build-stack-image
 
 on:
   push:
-    branches: ["main", "feat/**"]
+    branches: ["feat/selfhost-k3s"]
   workflow_dispatch:
 
 jobs:
