@@ -1,23 +1,24 @@
-# Gatekeeper K8s — Cluster Ops Gatekeeper: Design & API Review
+# Gatekeeper K8s — Cluster Ops Gatekeeper (READ-ONLY): Design & API Review
 
 *Status: **DESIGN REVIEW — implementation blocked until operator approval.***
-*Per the `write-gatekeeper` skill, the Session API is the most delicate part; review before building.*
+*Scope per operator decision (2026-08-07): **read operations only**. No writes, no approvals, no
+simulation. Write support (scale/restart/sync, approval-gated) is a documented future extension —
+the platform's approval machinery is untouched, so adding it later is purely additive.*
 
 ## 1. Overview
 
 A new gatekeeper package, `packages/gatekeeper-k8s`, that lets Cloudflare OS agents (and gadgets)
-interact with the homelab k3s cluster: read cluster state, monitor workloads (k8s-native:
-metrics.k8s.io, logs, events), manage ArgoCD applications, and perform write operations (scale,
-restart, sync) — every write gated by the Workshop's human approval queue.
+**read** the homelab k3s cluster: cluster state, workload health, logs, events, resource usage
+(k8s-native — metrics.k8s.io), and ArgoCD application status. **No mutating capability exists
+anywhere in the design** — not in the API, not in the service accounts, not in the proxy.
 
-Three resource families in one package (like `gatekeeper-google`'s multiple resource types), one
-`.d.ts` per family where disjoint:
+Three resource families in one package (like `gatekeeper-google`'s multiple resource types):
 
-| Family | Vendor id | Covers |
-|---|---|---|
-| **Kubernetes** | `k8s` | nodes, namespaces, workloads, pods, logs, events, PVCs, resource usage |
-| **ArgoCD** | `k8s` (same vendor) | applications: status, sync state, resources, sync/rollback |
-| **Monitoring** | `k8s` (same vendor) | k8s-native: pod/node metrics (`metrics.k8s.io`), logs, events — no new infra |
+| Family | Covers |
+|---|---|
+| **Kubernetes** | nodes, namespaces, workloads, pods, logs, events, PVCs, resource usage |
+| **ArgoCD** | applications: status, sync state, resources, history (read) |
+| **Monitoring** | k8s-native: pod/node metrics, logs, events — no new infra |
 
 ## 2. Architecture
 
@@ -29,155 +30,110 @@ Modeled on `gatekeeper-scheduler` / `gatekeeper-context`:
   account per user with **no OAuth flow**.
 - `AccountDescription.singleton: { tsType: "OpsSession" }` — the Workshop installs the singleton
   gatekeeper into every workspace and folds it into each chat's env as an **ambient binding**
-  named **`K8S`** (from `suggestedBindingName`). The agent calls it directly in `executeCode`:
-  `let ns = await env.K8S.namespace("default"); await ns.listDeployments();`
-- Deployment-level credentials (homelab single-tenant):
-  - **Kubernetes**: the pod's own service-account token (auto-rotated, mounted at
-    `/var/run/secrets/kubernetes.io/serviceaccount/token`) + a dedicated RBAC `ClusterRole`
-    bound to the cloudflare-os SA (scoped in `k8s/cloudflare-os/rbac.yaml`).
-  - **ArgoCD**: an API token (`argocd account generate-token` style) stored in a k8s Secret →
-    env `K8S_ARGOCD_TOKEN`. One-time bootstrap script (admin password → session → token), the
-    token itself is long-lived.
-- Observers: **strategy A (private-only)** — `addObserver()` always throws. Cluster access must
-  not leak to gadget collaborators; single-tenant homelab anyway.
+  named **`K8S`** (from `suggestedBindingName`): `let ns = await env.K8S.namespace("default");`
+- Observers: **strategy A (private-only)** — `addObserver()` always throws. Cluster state must
+  not leak to gadget collaborators via sharing; single-tenant homelab anyway.
 
-### 2.2 Transport (in-cluster, no ingress)
+### 2.2 Transport (in-cluster, no ingress) — TLS proxy with mandatory hardening
 
 The gatekeeper worker runs inside the cloudflare-os pod (same workerd process) and reaches:
 
-- **k8s API**: `https://kubernetes.default.svc:443` — **TLS risk**: the API server cert is signed
-  by the cluster CA, which workerd's fetch does not trust. **Chosen solution: a tiny Node
-  TLS-terminating proxy** started by the container entrypoint (reads `ca.crt` from the SA dir),
-  exposing `http://127.0.0.1:8443` → `https://kubernetes.default.svc`. The gatekeeper fetches
-  plain HTTP on loopback — no CA trust problem, ~30 lines, verified in the pod at implementation
-  time. (Fallback if the proxy proves awkward: `NODE_EXTRA_CA_CERTS` path — decided by a spike.)
-- **ArgoCD**: same proxy pattern, `http://127.0.0.1:8444` → `https://argocd-server.argocd.svc:443`
-  (proxy trusts ArgoCD's self-signed cert via `rejectUnauthorized: false` — traffic stays on the
-  pod→service network; documented tradeoff). Alternative (no custom CA): public ingress
-  `https://argocd.minhnguyenle.net` (LE cert) — picked if in-cluster proves flaky.
+- **k8s API**: `https://kubernetes.default.svc:443` — the API server cert is signed by the
+  cluster CA, which workerd's fetch does not trust. A tiny Node TLS-terminating proxy (started by
+  the container entrypoint, reading `ca.crt` from the SA dir) exposes
+  `http://127.0.0.1:8443` → `https://kubernetes.default.svc`.
+- **ArgoCD**: same pattern, `http://127.0.0.1:8444` → `https://argocd-server.argocd.svc:443`
+  (proxy trusts ArgoCD's self-signed cert; traffic stays on the pod→service network). Alternative
+  if flaky: public ingress `https://argocd.minhnguyenle.net` (LE cert).
 
-**SECURITY (critical — from design review):** the loopback proxy is reachable by EVERY worker in
- the same workerd process, including agent-written **gadget** Dynamic Workers, which in dev mode
- have unrestricted outbound fetch. A gadget could fetch `http://127.0.0.1:8443` directly and act
- as the SA token — bypassing the gatekeeper entirely. Hardening, all mandatory:
+**SECURITY (critical, from design review):** the loopback proxy is reachable by EVERY worker in
+the same workerd process, including agent-written **gadget** Dynamic Workers (unrestricted
+outbound in dev mode). A gadget could fetch the proxy directly and act as the service account,
+bypassing the gatekeeper. Hardening (mandatory):
 
-1. **Per-start random proxy token**: the entrypoint generates a random bearer token, the proxy
-   rejects any request without `Authorization: Bearer <token>`, and only the gatekeeper worker
-   receives it via env. Gadgets never see it. (Never a static default token.)
-2. The proxy binds **127.0.0.1 only** (never 0.0.0.0).
-3. The proxy forwards **only the API paths the gatekeeper uses** (k8s API group prefixes and
-   ArgoCD API prefixes) and only GET/list for read SAs — belt and suspenders.
+1. **Per-start random proxy token**: entrypoint generates a random bearer token; the proxy
+   rejects any request without `Authorization: Bearer <token>`; only the gatekeeper worker
+   receives it via env. Never a static default.
+2. Proxy binds **127.0.0.1 only**.
+3. Proxy forwards **only the API paths the gatekeeper uses** (k8s read-only API groups, ArgoCD
+   API prefixes) and **only GET/list/watch** — the proxy is read-only even against a compromised
+   gatekeeper.
 
-### 2.3 Credentials: split read/write service accounts (defense in depth)
+### 2.3 Credentials — ONE read-only service account
 
-The single shared SA was the weakest point of the first draft: one ambient token with write power
-meant a bug anywhere in the read path could write. Revised:
+- **`cfos-read` SA**: dedicated, long-lived SA Secret token → env. ClusterRole grants
+  **get/list/watch** on: nodes, namespaces, events, pods (incl. `pods/log`),
+  deployments/statefulsets/daemonsets/replicasets, PVCs, `metrics.k8s.io`.
+- **Explicitly NOT granted** (not just "not used" — absent from RBAC): secrets, serviceaccounts,
+  `pods/exec`, `pods/attach`, persistentvolumes, clusterroles/rolebindings, cert-manager CRs,
+  any update/patch/delete/create verb, any write on kube-system.
+- No write SA exists. The gatekeeper code cannot write even if every internal check failed.
+- Per-user identity is not modeled at the k8s layer (single-tenant): reads attribute to the SA;
+  per-read attribution lives in the Workshop's observation log.
 
-- **Read SA** (`cfos-read`): ambient, used by all read sessions. ClusterRole: get/list/watch on
-  nodes, namespaces, events, pods (incl. `pods/log`), deployments/statefulsets/daemonsets/
-  replicasets, PVCs, metrics.k8s.io. **Explicitly excluded: secrets, serviceaccounts,
-  pods/exec, pods/attach, persistentvolumes, clusterroles/rolebindings, cert-manager CRs,
-  HorizontalPodAutoscalers (write), kube-system write.**
-- **Write SA** (`cfos-write`): used **only inside `applyAction()`** for approved mutations.
-  ClusterRole: update/patch on deployments/statefulsets/daemonsets (scale/restart), delete on
-  pods; nothing else. Not ambient — the gatekeeper's write path holds it, and only applies it
-  after the approval queue says so.
-- Both tokens come from dedicated SA Secrets (long-lived, homelab-acceptable) exported to the
-  gatekeeper via env, never via the proxy.
+### 2.4 ArgoCD credential — dedicated scoped account, get-only
 
-Per-user identity is therefore **not** modeled at the k8s layer (single-tenant homelab): the
-approval queue is the only per-user gate, and the k8s audit log attributes actions to the SA, not
- the user. Upgrade path if multi-tenant: `createAccount()` mints a per-user SA via a bootstrap
- role — noted, not built.
+Bootstrap (one-time, needs the admin password from `argocd-initial-admin-secret`): create a
+dedicated local account `cfos-ops`, then **discard the admin token**. RBAC policies limited to
+**`get`** on applications/projects, **read** on logs/events. No `sync`, no `update`, no app
+creation/deletion, no project mutation. Token → k8s Secret → env `K8S_ARGOCD_TOKEN`.
 
-### 2.4 ArgoCD credential: dedicated scoped account, NOT admin
+### 2.5 Validation & hygiene
 
-First draft said "token from the admin account" — that hands the gatekeeper full ArgoCD power
-(app create/delete/projects). Revised: bootstrap creates a **dedicated local account**
-(`cfos-ops`) via the admin session, then the admin token is discarded. The account's RBAC
-policies are limited to: `get` on applications/projects, `sync`/`update` on applications in the
-`default` project, `*` on logs/events reads. No app creation, no deletion, no project mutation,
-no cluster management. The generated token goes into a k8s Secret → env `K8S_ARGOCD_TOKEN`.
-
-### 2.5 Validation & description hygiene
-
-- Resource names are validated against the k8s DNS-1123 charset before any API call; `kind` is
-  restricted to the `WorkloadKind` union at runtime (not just at type level); resource URLs are
-  parsed strictly (`%2F`, `..`, extra segments rejected).
-- Approval descriptions are **structured** (built from validated fields: kind, namespace, name,
-  replicas) — never raw user/agent strings — so the approval UI cannot be socially engineered
-  via newline injection or confusing text.
-
-### 2.3 Bindings & resource URLs
-
-| Resource URL | Granularity | Session |
-|---|---|---|
-| `k8s://cluster` | cluster-wide reads: nodes, namespaces, events, node metrics | `ClusterSession` |
-| `k8s://cluster/ns/:ns` | namespace reads: workloads, pods, PVCs, events, metrics, logs-listing | `NamespaceSession` |
-| `k8s://cluster/ns/:ns/pods/:name` | single pod: describe, logs, metrics, **restart**, **delete** | `PodSession` |
-| `k8s://cluster/ns/:ns/workloads/:kind/:name` | single workload (deploy/sts/ds/rs): describe, **scale**, **restart**, **delete** | `WorkloadSession` |
-| `argocd://apps` | list apps + projects (read) | `ArgoSession` |
-| `argocd://apps/:name` | app status/sync/resources/history, **sync**, **rollback** | `ArgoAppSession` |
-
-Ambient singleton session (`OpsSession`) is the capability-based root: it returns sub-sessions
-per resource. The per-URL resource bindings (for gadgets) share the same session impls.
+- Resource names validated against the k8s DNS-1123 charset before any API call; `kind`
+  restricted to the `WorkloadKind` union at runtime; resource URLs parsed strictly (`%2F`,
+  `..`, extra segments rejected).
+- Observation descriptions are structured (kind, namespace, name) — no raw strings — so the
+  audit log is clean and unspoofable.
 
 ### 2.6 Actors and use cases
 
 **Agent** (coding agent in any chat) — the primary consumer:
 
-- Gets the ambient `env.K8S` binding in every chat session (auto-provided singleton).
-- **Reads are ambient**: diagnosing, monitoring, and investigating are always available and
-  logged as observations. Use cases: "why is continue-story down?" (events → pod status →
-  `diagnose()` → logs), "is the cluster healthy?" (`cluster().listNodes()` + `nodeUsage()`),
-  "what's the ArgoCD sync state?" (`argo().listApps()`), "which pods are crashing?"
-  (namespace listPods → CrashLoopBackOff filter).
-- **Writes are proposal-only**: scale/restart/delete/sync/rollback always land in the workspace
-  owner's approval queue with a structured description; the agent may continue working
-  (simulation in Phase 2) but the change happens only on approval. Use cases: "scale the API
-  to 3 replicas", "restart that stuck deployment", "sync continue-story in ArgoCD".
-- The agent's JSDoc-driven discovery means the API surface IS the capability surface: methods
-  the type file doesn't declare do not exist for the agent.
+- Ambient `env.K8S` in every chat session. Everything it can do is a **read, logged as an
+  observation**.
+- Use cases: "why is continue-story down?" (events → pod status → `diagnose()` → logs), "is the
+  cluster healthy?" (`cluster().listNodes()` + `nodeUsage()`), "what's the ArgoCD sync state?"
+  (`argo().listApps()`, `argoApp("continue-story").status()`), "which pods are crashing?"
+  (namespace listPods → CrashLoopBackOff), "how much memory does litellm use?"
+  (`podUsage()` / `pod().usage()`).
+- The agent cannot propose changes — there are no write methods at all. If it detects a problem,
+  it reports it to the user, who acts via kubectl/ArgoCD (or, in a future extension, approves a
+  proposed action).
 
-**User** (human, homelab single tenant = the owner):
+**User** (human owner):
 
-- **Approves/rejects every cluster mutation**, one-by-one or batched, from the Workshop UI;
-  nothing is ever auto-approved (`getAutoApprovableActions() = []`).
-- **Audits the agent**: every read the agent made is an observation in the workspace's action
-  log (what was read, when, through which binding).
-- **Grants scope**: the K8S account is auto-provisioned (Connections panel, admin can set the
-  vendor to disabled/optional/enabled); per-gadget bindings are created by pasting a resource
-  URL (`k8s://cluster/ns/:ns`, `argocd://apps/:name`, …) — the user decides how broad each
-  gadget's access is.
+- **Audits the agent**: every read is an observation in the workspace's action log (what was
+  read, when, through which binding). Nothing to approve — there are no actions.
+- **Grants scope**: the K8S account auto-provisions (Connections panel; admin can set the vendor
+  to disabled/optional/enabled); per-gadget bindings are created by pasting a resource URL — the
+  user decides how broad each gadget's access is.
 - **Admin surface**: can disable the whole vendor in the Gatekeepers admin panel.
 
 **Workspace** (gadget's persistent code):
 
-- **No ambient access** — the singleton is chat-only. A gadget gets cluster access only when the
-  agent or user wires a binding (`setGadgetBinding`) to a specific resource URL.
-- Gadget code calls the same session methods; reads are observations, writes queue to the
-  **workspace owner's** approval queue (approvals are per-workspace, not per-actor).
-- **Sharing**: observer strategy A — a gadget bound to K8S cannot be shared; collaborators get
-  denied at open. Cluster data never leaks across users.
-- Use cases: an ops dashboard gadget rendering namespace health; a watchdog gadget that alerts
-  on ArgoCD drift; a "scale my game server" button gadget.
+- **No ambient access** — bindings only (agent or user wires `setGadgetBinding` to a resource
+  URL).
+- Gadget code calls the same read-only session methods; each read is an observation in the
+  **workspace owner's** log.
+- **Sharing**: strategy A — a gadget bound to K8S cannot be shared.
+- Use cases: ops dashboard gadget rendering namespace health; ArgoCD drift watch gadget;
+  "cluster status" widget.
 
 Actor capability summary:
 
-| Actor | Read (observation, logged) | Write (approval-gated) | Ambient? |
+| Actor | Reads (observation, logged) | Writes | Ambient? |
 |---|---|---|---|
-| Agent | full cluster/argo/monitoring surface | yes — always queued | yes (`env.K8S` in every chat) |
-| User | via UI/agent, plus full audit log | approves/rejects everything | own account |
-| Workspace | only what its bindings' URLs scope | yes — owner's queue | no — binding required |
-
----
+| Agent | full cluster/argo/monitoring surface | **none — by design** | yes (`env.K8S` in every chat) |
+| User | via UI/agent, plus full audit log | none via this gatekeeper (kubectl/ArgoCD directly) | own account |
+| Workspace | only what its bindings' URLs scope | none | no — binding required |
 
 ## 3. Draft `types.d.ts` — THE REVIEW ARTIFACT
 
 ```ts
-// Agent-facing API for the K8S gatekeeper. All reads are observations (logged);
-// mutating methods are marked "(requires approval)" and wait for the user.
-// Errors are thrown as Error with a message; HTTP-ish statuses are surfaced in the message.
+// Agent-facing API for the K8S gatekeeper (READ-ONLY).
+// Every method is an observation: the read is logged to the workspace audit trail.
+// There are no mutating methods. Errors are thrown as Error with a descriptive message.
 
 /** Root capability: the ambient cluster-ops session (chat env binding `K8S`). */
 export interface OpsSession {
@@ -185,13 +141,13 @@ export interface OpsSession {
   cluster(): Promise<ClusterSession>;
   /** Operations scoped to one namespace. */
   namespace(name: string): Promise<NamespaceSession>;
-  /** Single pod operations (describe, logs, metrics, restart, delete). */
+  /** Single pod operations (describe, logs, metrics, diagnose). */
   pod(namespace: string, name: string): Promise<PodSession>;
   /** Single workload operations (deployments, statefulsets, daemonsets, replicasets). */
   workload(namespace: string, kind: WorkloadKind, name: string): Promise<WorkloadSession>;
   /** ArgoCD operations (list applications, projects). */
   argo(): Promise<ArgoSession>;
-  /** Single ArgoCD application operations (status, sync state, sync, rollback). */
+  /** Single ArgoCD application operations (status, sync state, history). */
   argoApp(name: string): Promise<ArgoAppSession>;
 }
 
@@ -295,7 +251,7 @@ export interface NamespaceSession {
   events(options?: { warningsOnly?: boolean; limit?: number }): Promise<K8sEvent[]>;
 }
 
-/** Single pod operations. Logs/metrics are reads; restart/delete require approval. */
+/** Single pod operations (read-only). */
 export interface PodSession {
   /** Full pod description: containers, conditions, node, QoS, labels. */
   describe(): Promise<{
@@ -316,15 +272,11 @@ export interface PodSession {
   usage(): Promise<Usage>;
   /** Recent log lines of a container (default: first container, last 200 lines). */
   logs(options?: { container?: string; tail?: number; previous?: boolean }): Promise<string>;
-  /** Crash loop / terminated state details if the pod is unhealthy. */
-  diagnose(): Promise<string>;   // one-liner: why is this pod not Ready
-  /** Delete the pod (Kubernetes reschedules it per its owner). (requires approval) */
-  delete(): Promise<void>;
-  /** Force-restart by deleting the pod. (requires approval) */
-  restart(): Promise<void>;
+  /** One-liner explaining why this pod is not Ready, if it isn't. */
+  diagnose(): Promise<string>;
 }
 
-/** Single workload operations. Writes require approval. */
+/** Single workload operations (read-only). */
 export interface WorkloadSession {
   /** Workload description: spec + status, images, selector, strategy. */
   describe(): Promise<{
@@ -340,12 +292,6 @@ export interface WorkloadSession {
   }>;
   /** Pods owned by this workload. */
   pods(): Promise<PodSummary[]>;
-  /** Scale to a replica count. (requires approval) */
-  scale(replicas: number): Promise<void>;
-  /** Rolling restart (new ReplicaSet with same image). (requires approval) */
-  restart(): Promise<void>;
-  /** Delete the workload. (requires approval) */
-  delete(): Promise<void>;
 }
 
 /** ArgoCD application (summary). */
@@ -370,9 +316,9 @@ export interface ArgoSession {
   listProjects(): Promise<{ name: string; sourceRepos: string[]; clusters: string[] }[]>;
 }
 
-/** Single ArgoCD application operations. Sync/rollback require approval. */
+/** Single ArgoCD application operations (read-only). */
 export interface ArgoAppSession {
-  /** Application status: health, sync state, operation state. */
+  /** Application status: health, sync state, operation state, resources. */
   status(): Promise<{
     name: string;
     health: string;
@@ -385,25 +331,17 @@ export interface ArgoAppSession {
   }>;
   /** Sync/rollback history. */
   history(): Promise<{ id: number; revision: string; deployedAt: string; initiatedBy: string }[]>;
-  /** Trigger a sync to the target revision. (requires approval) */
-  sync(options?: { revision?: string }): Promise<void>;
-  /** Roll back to a previous deployment id (from history()). (requires approval) */
-  rollback(deploymentId: number): Promise<void>;
-  /** Hard refresh of the app cache. (requires approval) */
-  refresh(): Promise<void>;
 }
 ```
 
-## 4. Observation / action mapping
+## 4. Observation model
 
-| Operation | Classification |
-|---|---|
-| All `list*`, `describe`, `logs`, `usage`, `events`, `diagnose`, `status`, `history`, `listProjects` | **Observation** — `authorizeObservation()` before returning; logged for audit |
-| `scale`, `restart`, `delete` (k8s), `sync`, `rollback`, `refresh` (argo) | **Action** — `submitAction()`; applied only after human approval (`applyAction`). Description text names resource + change (`"Scale deployment/nginx in ns default to 3 replicas"`) |
-| `getAutoApprovableActions()` | `[]` — never auto-approve cluster mutations |
-
-Phase 2 simulation: reads overlay pending actions (scale → `describe().replicas.desired` shows the
-pending value until approved/rejected). No other caching in Phase 1 beyond per-request freshness.
+- **Every method is an observation**: `authorizeObservation()` is awaited before any data is
+  returned; the read is recorded in the workspace's action log with a structured description.
+- **No actions exist**: `applyAction()` / `rejectAction()` / `revertAction()` throw (the
+  `gatekeeper-scheduler` read-only pattern). `getAutoApprovableActions()` returns `[]`.
+- Future write extension: add mutating methods + `submitAction()`; nothing else in the platform
+  needs to change (approval machinery is gatekeeper-agnostic).
 
 ## 5. Config & integration changes
 
@@ -411,37 +349,39 @@ pending value until approved/rejected). No other caching in Phase 1 beyond per-r
 |---|---|
 | New package `packages/gatekeeper-k8s/` (wrangler.jsonc, migrations for the Gatekeeper DO + account) | fork repo |
 | `GATEKEEPERS` env: `context,homeassistant,mcp,scheduler,k8s` | `k8s/cloudflare-os/deployment.yaml` |
-| Passthrough vars in `run-dev-server.js` (`K8S_SA_TOKEN`, `K8S_ARGOCD_TOKEN`, `K8S_API_PROXY`, `ARGOCD_BASE`) | fork (small patch) |
-| Entrypoint wrapper exports SA token + starts TLS proxy (node, reads SA dir) | image (`Dockerfile`/entrypoint) |
-| `rbac.yaml`: ClusterRole (read most, write pods/deployments/statefulsets/daemonsets) + RoleBinding to cloudflare-os SA | `k8s/cloudflare-os/` |
-| Secret `cfos-argocd-token` (ArgoCD API token) + bootstrap script | k8s repo + one-time run |
+| Passthrough vars in `run-dev-server.js` (`K8S_READ_TOKEN`, `K8S_ARGOCD_TOKEN`, `K8S_PROXY_TOKEN`, `K8S_API_PROXY`, `ARGOCD_BASE`) | fork (small patch) |
+| Entrypoint wrapper: exports SA tokens + starts read-only TLS proxy (node, reads SA dir) | image (`Dockerfile`/entrypoint) |
+| `rbac.yaml`: `cfos-read` SA + ClusterRole (get/list/watch as §2.3, explicit exclusions) | `k8s/cloudflare-os/` |
+| Secret `cfos-argocd-token` + one-time bootstrap (scoped `cfos-ops` account) | k8s repo + one-time run |
 | Deploy loop: CI rebuild → manual tag bump → ArgoCD sync | established |
 
 ## 6. Phase plan
 
 1. **This design review** (you are here) — approve or request changes to §3.
-2. **Phase 1**: package skeleton; vendor/account/singleton (auto-provision); k8s + argo + monitoring
-   read sessions via the proxy; observations + approval queue for writes; minimal URL-paste
-   configurator (resource bindings for gadgets); `types:check` + unit tests (mocked k8s/argo HTTP).
-3. **Spike first**: TLS proxy + SA token plumbing verified in the pod *before* session impls.
-4. **Phase 2** (after review): action simulation, observer strategy A hardening, resource-picker
-   UI, hook support (e.g. watch ArgoCD sync failures → notify gadget) if wanted.
+2. **Spike**: TLS proxy + token plumbing verified in the pod (proxy rejects requests without the
+   bearer token; read-only path allowlist confirmed) — before any session code.
+3. **Phase 1**: package skeleton; vendor/account/singleton (auto-provision); k8s + argo +
+   monitoring read sessions via the proxy; observations; minimal URL-paste configurator;
+   `types:check` + unit tests (mocked k8s/argo HTTP).
+4. **Phase 2** (separate review): resource-picker UI; per-workspace read rate limiting; optional
+   hooks (e.g. ArgoCD sync-failure watch). Read-only remains the contract.
 
 ## 7. Risks
 
 - **TLS to k8s API / argocd-server** — mitigated by the loopback proxy (no CA trust needed); the
-  proxy is itself a bypass surface, closed by the per-start bearer token + loopback-only bind +
+  proxy is a bypass surface, closed by the per-start bearer token + loopback-only bind + read-only
   path allowlist (§2.2). Spike verifies in-cluster before building on it.
-- **Shared identity at the k8s layer** — all actions run as the read/write SAs; per-user
-  attribution comes from the Workshop's approval/observation logs, not the k8s audit log.
-  Accepted for single-tenant; per-user SA minting is the documented upgrade path (§2.3).
-- **Write blast radius** — write SA is limited to scale/restart/delete on workload kinds and
-  pods, used only inside `applyAction()`; read SA explicitly excludes secrets/exec/attach;
-  ArgoCD uses a scoped account, not admin (§2.3, §2.4).
-- **SA token rotation** — dedicated SA Secrets are long-lived (homelab-acceptable); rotating
-  them = recreate Secret + env + restart. The pod-projected token option was dropped in favor
-  of split SAs.
-- **Abuse/rate limits** — an agent could hammer read APIs; observations are logged but not
-  rate-limited. Phase 2 hardening: per-workspace rate limiting in the gatekeeper DO.
-- **ArgoCD token bootstrap** needs the admin password once (`argocd-initial-admin-secret`); the
-  admin token is discarded after the scoped `cfos-ops` account is created.
+- **Proxy bypass** — without the bearer-token fix, gadget code could read cluster state directly
+  as the SA (bypassing observation logging). Mitigated as §2.2; the read-only SA limits even a
+  full bypass to reads.
+- **Shared identity** — reads attribute to the SA at the k8s layer; per-read attribution is in the
+  Workshop observation log. Accepted for single-tenant.
+- **Data exposure surface** — the read SA deliberately excludes secrets/exec/PVs/kube-system
+  writes; logs can still contain sensitive strings (the agent reading logs is the feature);
+  observation logging records what was read.
+- **Rate limits** — an agent could hammer read APIs; observations are logged but not rate-limited.
+  Phase 2 hardening.
+- **ArgoCD bootstrap** needs the admin password once; admin token discarded after the scoped
+  account is created.
+- **No write capability is the primary control** — even a fully compromised gatekeeper or gadget
+  cannot mutate the cluster through this path (kubectl/ArgoCD CLI access is out of band).
