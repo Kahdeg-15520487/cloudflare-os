@@ -80,4 +80,9 @@ ENV WRANGLER_DEV_IP=0.0.0.0 \
     SKIP_GATEKEEPER_UI_BUILDS=true \
     XDG_CACHE_HOME=/opt/cfos-cache
 
-CMD ["node", "run-dev-server.js", "--serve-frontend-assets"]
+# Entrypoint generates the per-container proxy token and starts the read-only TLS proxy
+# (gatekeeper-k8s) when the cluster credentials are present.
+COPY scripts/entrypoint.sh scripts/k8s-proxy.mjs /app/scripts/
+RUN chmod +x /app/scripts/entrypoint.sh
+
+CMD ["/app/scripts/entrypoint.sh"]

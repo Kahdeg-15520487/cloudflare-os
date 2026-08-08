@@ -207,6 +207,12 @@ const PASSTHROUGH_GATEKEEPER_VARS = {
     "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_ALLOW_INSECURE",
   ],
   "gatekeeper-mcp": ["MCP_ALLOW_INSECURE"],
+  // Read-only cluster-ops gatekeeper: the k8s SA token, ArgoCD account token, the
+  // per-container proxy token, and the loopback proxy / upstream endpoints.
+  "gatekeeper-k8s": [
+    "K8S_READ_TOKEN", "K8S_ARGOCD_TOKEN", "K8S_PROXY_TOKEN",
+    "K8S_API_PROXY", "ARGOCD_API_PROXY", "K8S_API_SERVER", "ARGOCD_API_SERVER",
+  ],
 };
 
 for (const gk of gatekeepers) {
