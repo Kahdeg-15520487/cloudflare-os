@@ -227,6 +227,19 @@ for (const gk of gatekeepers) {
     if (config.vars.CLIENT_SECRET === undefined) config.vars.CLIENT_SECRET = process.env[shared.secret];
   }
 
+  // OAuth gatekeepers build their authorization-callback URLs from BASE_URL and fall back
+  // to http://localhost:8787/gatekeeper/<name> when it is unset. On self-hosted deployments
+  // the backend routes /gatekeeper/<name>/* at PUBLIC_BASE_URL, so derive BASE_URL from it;
+  // otherwise the redirect_uri sent to the provider points at localhost and is rejected with
+  // redirect_uri_mismatch.
+  if (shared && process.env.PUBLIC_BASE_URL) {
+    config.vars = config.vars || {};
+    if (config.vars.BASE_URL === undefined) {
+      const base = process.env.PUBLIC_BASE_URL.replace(/\/+$/, "");
+      config.vars.BASE_URL = `${base}/gatekeeper/${gk.name}`;
+    }
+  }
+
   // The shell wins over the committed default, so `MCP_ALLOW_INSECURE=true` can override the
   // `"false"` in wrangler.jsonc without editing it.
   for (const name of PASSTHROUGH_GATEKEEPER_VARS[gk.name] ?? []) {
