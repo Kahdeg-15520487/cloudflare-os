@@ -82,10 +82,14 @@ function findGatekeepers(parentDir) {
 // separate workerd isolate, so each one costs memory (16 of them exceed ~3Gi on a small
 // node). GATEKEEPERS is a comma-separated allowlist of package names (e.g.
 // GATEKEEPERS=context,homeassistant,mcp,scheduler); unset/empty keeps all of them.
+// Both the full package name ("gatekeeper-context") and the short name ("context")
+// are accepted, since findGatekeepers() reports full directory names.
 const gatekeeperAllowlist = (process.env.GATEKEEPERS ?? "")
     .split(",").map(s => s.trim()).filter(Boolean);
 const gatekeepers = findGatekeepers(PACKAGES_DIR)
-    .filter(gk => gatekeeperAllowlist.length === 0 || gatekeeperAllowlist.includes(gk.name));
+    .filter(gk => gatekeeperAllowlist.length === 0
+        || gatekeeperAllowlist.includes(gk.name)
+        || gatekeeperAllowlist.includes(gk.name.replace(/^gatekeeper-/, "")));
 
 // The Context Library (packages/gatekeeper-context) is discovered by findGatekeepers and bound
 // like any other gatekeeper (GATEKEEPER_CONTEXT -> GatekeeperVendor). Its describe() reports
