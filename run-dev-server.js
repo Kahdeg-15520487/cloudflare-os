@@ -240,7 +240,10 @@ for (const gk of gatekeepers) {
     config.vars = config.vars || {};
     if (config.vars.BASE_URL === undefined) {
       const base = process.env.PUBLIC_BASE_URL.replace(/\/+$/, "");
-      config.vars.BASE_URL = `${base}/gatekeeper/${gk.name}`;
+      // Gatekeepers already default to http://localhost:8787/gatekeeper/<shortName>,
+      // so derive the same shape from PUBLIC_BASE_URL (no "gatekeeper-" prefix).
+      const shortName = gk.name.replace(/^gatekeeper-/, "");
+      config.vars.BASE_URL = `${base}/gatekeeper/${shortName}`;
     }
   }
 
