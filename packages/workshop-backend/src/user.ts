@@ -12,6 +12,9 @@ import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { CopilotLoginAttemptImpl } from "./copilot-login.js";
+import { githubCopilotOAuth } from "./copilot-oauth.js";
+import type { CopilotLoginAttempt, CopilotLoginStatus } from "@gadgets/workshop-shared/api";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -66,6 +69,16 @@ export type UserAiModelRecord = {
   profile: AiChatAuthorInfo;
   config: AiModelConfig;
 }
+
+// The account's stored GitHub Copilot sign-in (see UserDurableObject.startCopilotLogin).
+// Never exposed over RPC; model configs carry a copy of `token` as their apiToken.
+type CopilotCredentialRecord = {
+  // The device-flow token (long-lived GitHub access token).
+  token: string;
+  // Copilot model ids the account may use, when the API reported them.
+  availableModelIds?: string[];
+  loggedInAt: Date;
+};
 
 export type UserChatContext = {
   profile: AiChatAuthorInfo;
@@ -195,6 +208,10 @@ function makeUserStorage(storage: DurableObjectStorage) {
       preferredModel: <string | null>null,
       onboardingCompleted: false,
 
+      // Stored GitHub Copilot sign-in, shared by every Copilot model config (null = not
+      // signed in). Set by the OAuth flow in startCopilotLogin(); see getCopilotLoginStatus.
+      copilotCredential: <CopilotCredentialRecord | null>null,
+
       // Set once the user's pre-existing workspaces have been asked to populate the outputs index
       // (see #backfillOutputs()). Workspaces created since push on their own.
       outputsBackfilled: false,
@@ -277,6 +294,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  #copilotLogin: CopilotLoginAttemptImpl | undefined;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -530,8 +548,70 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
     }
 
+    // Copilot models carry no user-entered key: the backend fills apiToken from the
+    // account's stored sign-in (shared by every Copilot model).
+    if (config.provider === "github-copilot") {
+      const credential = this.storage.copilotCredential.get();
+      if (!credential) {
+        throw new Error("Sign in with GitHub Copilot first (Add AI Model → Sign in with GitHub Copilot).");
+      }
+      config = {...config, apiToken: credential.token};
+    }
+
     profile.type = "agent";
     this.storage.aiModels.put({profile, config});
+  }
+
+  async getCopilotLoginStatus(): Promise<CopilotLoginStatus> {
+    const credential = this.storage.copilotCredential.get();
+    return {
+      signedIn: credential !== null,
+      ...(credential?.availableModelIds
+          ? { availableModelIds: credential.availableModelIds }
+          : {}),
+    };
+  }
+
+  async disconnectCopilotLogin(): Promise<void> {
+    // Existing Copilot model configs keep their token copy (still valid until GitHub revokes
+    // it); only the shared credential is removed, so new models require a fresh sign-in.
+    this.storage.copilotCredential.put(null);
+  }
+
+  async startCopilotLogin(): Promise<RpcStub<CopilotLoginAttempt>> {
+    // Only one device flow at a time per user; abandon a previous one.
+    this.#copilotLogin?.cancel();
+    const attempt = new CopilotLoginAttemptImpl();
+    this.#copilotLogin = attempt;
+    attempt.run();
+    // Persist the credential when the flow completes (even if the client closed the modal
+    // or never awaited wait()); cancelled or failed attempts reject and are ignored.
+    attempt.waitForCredential().then(
+        (credential) => this.#persistCopilotLogin(credential),
+        () => {},
+    );
+    // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
+    //     system doesn't know this.
+    return attempt;
+  }
+
+  // Store the sign-in and refresh the token copy in every existing Copilot model config, so a
+  // re-login propagates everywhere.
+  #persistCopilotLogin(credential: Awaited<ReturnType<typeof githubCopilotOAuth.login>>): void {
+    const record: CopilotCredentialRecord = {
+      token: credential.refresh,
+      availableModelIds: credential.availableModelIds as string[] | undefined,
+      loggedInAt: new Date(),
+    };
+    this.storage.copilotCredential.put(record);
+    for (const model of this.storage.aiModels.list()) {
+      if (model.config.provider === "github-copilot" && model.config.apiToken !== record.token) {
+        this.storage.aiModels.put({
+          ...model,
+          config: {...model.config, apiToken: record.token},
+        });
+      }
+    }
   }
 
   async deleteModel(id: string): Promise<void> {

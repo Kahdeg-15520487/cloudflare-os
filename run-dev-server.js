@@ -319,11 +319,16 @@ if (backendHost) {
         "a Wrangler --port override.");
   }
 }
+// Containers need wrangler to listen on all interfaces (host port forwarding
+// cannot reach a loopback-only listener). Set WRANGLER_DEV_IP=0.0.0.0 in docker.
+if (process.env.WRANGLER_DEV_IP) {
+  args.push("--ip", process.env.WRANGLER_DEV_IP);
+}
 console.log(`\nStarting: wrangler dev ${args.join(" ")}\n`);
 
 try {
   execFileSync("pnpm", ["exec", "wrangler", "dev", ...args],
-      { stdio: "inherit", cwd: ROOT });
+      { stdio: "inherit", cwd: ROOT, shell: process.platform === "win32" });
 } catch (e) {
   // wrangler was killed or exited with an error; the output was already shown
   // via stdio: "inherit", so just propagate the exit code.

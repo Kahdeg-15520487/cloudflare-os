@@ -1,0 +1,26 @@
+# Local dev for Cloudflare OS (https://github.com/cloudflare/cloudflare-os)
+# Usage: docker compose up -d --build  →  http://localhost:8787
+services:
+  cloudflare-os:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cloudflare-os:local
+    ports:
+      - "8787:8787"
+    environment:
+      # Wrangler dev in a container is non-interactive; keep it that way.
+      - CI=true
+      - WRANGLER_SEND_METRICS=false
+      # Listen on all interfaces so host port forwarding can reach it.
+      - WRANGLER_DEV_IP=0.0.0.0
+    init: true
+    restart: unless-stopped
+    volumes:
+      # Persist local Durable Object storage (users, sessions, workspaces, models) across
+      # container recreates — without this, every rebuild/recreate wipes wrangler's local
+      # state and invalidates every browser session ("invalid session token").
+      - wrangler-state:/app/.wrangler/state
+
+volumes:
+  wrangler-state:

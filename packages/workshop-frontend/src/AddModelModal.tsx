@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS, CopilotDeviceCode, CopilotLoginAttempt } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -22,6 +22,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
+  'github-copilot': 'GitHub Copilot',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -31,6 +32,7 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
+  'github-copilot': 'Sign in with GitHub Copilot to generate',
 }
 
 // Example used in the custom-model placeholders for providers that have no suggested models
@@ -60,8 +62,11 @@ function decodeSelection(value: string): SelectionType {
   return { type: 'suggested', provider, modelId, displayName }
 }
 
-// Build the flat list of options for the Select dropdown.
-function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null) {
+// Build the flat list of options for the Select dropdown. `copilotAvailable`, when set (a
+// successful Copilot sign-in reported the account's model ids), hides Copilot suggestions the
+// account cannot use.
+function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null,
+    copilotAvailable: Set<string> | null) {
   const options: { value: string; label: string; provider: string }[] = []
   const providerOrder = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
@@ -71,6 +76,7 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {
       for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
+        if (provider === 'github-copilot' && copilotAvailable && !copilotAvailable.has(modelId)) continue
         options.push({
           value: encodeSelection(provider, modelId),
           label: model.name,
@@ -109,14 +115,104 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   // Advanced settings collapsible state
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
+  // GitHub Copilot device-flow sign-in state.
+  type CopilotPhase = 'idle' | 'starting' | 'awaiting-code' | 'signed-in' | 'error'
+  const [copilotPhase, setCopilotPhase] = useState<CopilotPhase>('idle')
+  const [copilotCode, setCopilotCode] = useState<CopilotDeviceCode | null>(null)
+  const [copilotError, setCopilotError] = useState('')
+  // Copilot model ids the signed-in account may use, when GitHub reported them.
+  const [copilotAvailable, setCopilotAvailable] = useState<Set<string> | null>(null)
+  const copilotStub = useRef<RpcStub<CopilotLoginAttempt> | null>(null)
+  const copilotCancelled = useRef(false)
+
+  const cancelCopilotLogin = () => {
+    const stub = copilotStub.current
+    copilotStub.current = null
+    if (stub) {
+      stub.cancel()
+      stub[Symbol.dispose]()
+    }
+  }
+
+  const handleCopilotSignIn = async () => {
+    setCopilotPhase('starting')
+    setCopilotError('')
+    copilotCancelled.current = false
+    try {
+      const stub = await authenticatedApi.startCopilotLogin()
+      copilotStub.current = stub
+      const code = await stub.waitForDeviceCode()
+      setCopilotCode(code)
+      setCopilotPhase('awaiting-code')
+      const result = await stub.wait()
+      copilotStub.current = null
+      stub[Symbol.dispose]()
+      setCopilotAvailable(result.availableModelIds ? new Set(result.availableModelIds) : null)
+      // Auto-select the first Copilot suggestion the account can use.
+      const suggestions = Object.entries(SUGGESTED_MODELS['github-copilot'])
+      const pick = result.availableModelIds
+        ? suggestions.find(([id]) => result.availableModelIds!.includes(id)) ?? suggestions[0]
+        : suggestions[0]
+      if (pick) {
+        const sel = {
+          type: 'suggested' as const,
+          provider: 'github-copilot' as const,
+          modelId: pick[0],
+          displayName: pick[1].name,
+        }
+        setSelection(sel)
+        setSelectValue(encodeSelection(sel.provider, sel.modelId))
+        setModelId(sel.modelId)
+        setDisplayName(sel.displayName)
+      }
+      setCopilotPhase('signed-in')
+    } catch (error: any) {
+      copilotStub.current = null
+      if (copilotCancelled.current) {
+        copilotCancelled.current = false
+        setCopilotPhase('idle')
+      } else {
+        setCopilotError(error?.message ?? String(error))
+        setCopilotPhase('error')
+      }
+    }
+  }
+
+  const handleCopilotSignOut = async () => {
+    try {
+      await authenticatedApi.disconnectCopilotLogin()
+      setCopilotPhase('idle')
+      setCopilotCode(null)
+      setCopilotAvailable(null)
+      setCopilotError('')
+    } catch (error: any) {
+      setCopilotError(error?.message ?? String(error))
+      setCopilotPhase('error')
+    }
+  }
+
+  const handleCopilotCancel = () => {
+    copilotCancelled.current = true
+    cancelCopilotLogin()
+    setCopilotCode(null)
+    setCopilotPhase('idle')
+  }
+
   const gatewayMode = aiConfig?.enabled === true
   const enabledProviders: Set<string> | null = gatewayMode
     ? new Set(aiConfig.enabledProviders)
     : null
 
-  // Reset all state when dialog closes
+  // Reset all state when dialog closes; on open, pick up an existing stored Copilot sign-in
+  // so adding another Copilot model never re-runs the OAuth flow.
   useEffect(() => {
     if (!visible) {
+      copilotCancelled.current = true
+      cancelCopilotLogin()
+      setCopilotPhase('idle')
+      setCopilotCode(null)
+      setCopilotError('')
+      setCopilotAvailable(null)
       setSelection(null)
       setSelectValue(undefined)
       setModelId('')
@@ -128,6 +224,21 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setAdvancedOpen(false)
     }
   }, [visible])
+
+  useEffect(() => {
+    if (!visible || gatewayMode) return
+    let disposed = false
+    authenticatedApi.getCopilotLoginStatus().then((status) => {
+      if (disposed) return
+      if (status.signedIn) {
+        setCopilotPhase('signed-in')
+        setCopilotAvailable(status.availableModelIds ? new Set(status.availableModelIds) : null)
+      }
+    }).catch(() => {
+      // Status check failed (e.g. backend hiccup); fall back to the sign-in button.
+    })
+    return () => { disposed = true }
+  }, [visible, gatewayMode, authenticatedApi])
 
   const handleModelSelect = (value: string) => {
     setSelectValue(value)
@@ -163,8 +274,14 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     const isCloudflare = selection?.provider === 'cloudflare'
     const showCredentials = !gatewayMode
 
-    if (showCredentials && selection && !isOllama && !apiToken.trim()) {
-      newErrors.apiToken = 'Please enter your API token'
+    if (showCredentials && selection && !isOllama) {
+      if (selection.provider === 'github-copilot') {
+        if (copilotPhase !== 'signed-in') {
+          newErrors.apiToken = 'Sign in with GitHub Copilot to generate a token'
+        }
+      } else if (!apiToken.trim()) {
+        newErrors.apiToken = 'Please enter your API token'
+      }
     }
 
     if (showCredentials && isCloudflare && !accountId.trim()) {
@@ -197,7 +314,10 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       const config: AiModelConfig = {
         provider: selection!.provider,
         model: finalModelId,
-        apiToken: gatewayMode ? '' : apiToken.trim(),
+        // GitHub Copilot models carry no user-entered key: the backend fills apiToken from
+        // the account's stored sign-in (shared by every Copilot model).
+        apiToken: gatewayMode ? '' :
+            (selection!.provider === 'github-copilot' ? '' : apiToken.trim()),
         ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
         ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
       }
@@ -213,7 +333,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     }
   }
 
-  const options = buildOptions(gatewayMode, enabledProviders)
+  const options = buildOptions(gatewayMode, enabledProviders, copilotAvailable)
   const showCustomFields = selection?.type === 'custom'
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
@@ -269,6 +389,59 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             ))}
           </Select>
 
+          {/* GitHub Copilot device-flow sign-in (no API key required) */}
+          {showCredentials && (
+            <div className="rounded-lg border border-kumo-line p-3 space-y-2">
+              {copilotPhase === 'idle' && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm">
+                    <div className="font-medium">GitHub Copilot</div>
+                    <div className="text-xs text-kumo-subtle">Use your GitHub Copilot subscription — no API key needed.</div>
+                  </div>
+                  <Button variant="secondary" onClick={handleCopilotSignIn}>Sign in with GitHub Copilot</Button>
+                </div>
+              )}
+              {copilotPhase === 'starting' && (
+                <div className="text-sm text-kumo-subtle">Starting sign-in…</div>
+              )}
+              {copilotPhase === 'awaiting-code' && copilotCode && (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">Authorize GitHub Copilot</div>
+                  <div className="text-sm">
+                    Open{' '}
+                    <a href={copilotCode.verificationUri} target="_blank" rel="noreferrer"
+                        className="underline text-kumo-link">
+                      {copilotCode.verificationUri}
+                    </a>{' '}
+                    and enter:
+                  </div>
+                  <div className="rounded bg-kumo-surface px-4 py-2 text-center font-mono text-xl tracking-widest">
+                    {copilotCode.userCode}
+                  </div>
+                  <div className="text-xs text-kumo-subtle">
+                    Waiting for you to authorize…{' '}
+                    {copilotCode.expiresInSeconds ? `(code expires in ~${Math.ceil(copilotCode.expiresInSeconds / 60)} min)` : ''}
+                  </div>
+                  <Button variant="secondary" onClick={handleCopilotCancel}>Cancel</Button>
+                </div>
+              )}
+              {copilotPhase === 'signed-in' && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm text-green-700 dark:text-green-400">
+                    ✓ Signed in with GitHub Copilot. Pick any Copilot model above and press Add Model.
+                  </div>
+                  <Button variant="secondary" onClick={handleCopilotSignOut}>Sign out</Button>
+                </div>
+              )}
+              {copilotPhase === 'error' && (
+                <div className="space-y-2">
+                  <div className="text-sm text-red-700 dark:text-red-400">Sign-in failed: {copilotError}</div>
+                  <Button variant="secondary" onClick={handleCopilotSignIn}>Retry</Button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Custom model fields */}
           {showCustomFields && (
             <>
@@ -307,8 +480,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             />
           )}
 
-          {/* API Token */}
-          {showCredentials && selection && (
+          {/* API Token — hidden for GitHub Copilot: its credential comes from the sign-in panel */}
+          {showCredentials && selection && selection.provider !== 'github-copilot' && (
             <SensitiveInput
               label="API Token"
               placeholder={API_TOKEN_PLACEHOLDERS[selection.provider]}

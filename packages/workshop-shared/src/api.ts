@@ -31,6 +31,47 @@ export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
 ]);
 
+// A pending GitHub Copilot sign-in attempt, returned by `AuthenticatedApi.startCopilotLogin()`.
+// Safe to call `waitForDeviceCode()` immediately after; `wait()` resolves once the user
+// authorizes in their browser. Dispose the stub (or call `cancel()`) to abandon the attempt.
+export interface CopilotLoginAttempt extends RpcTarget {
+  // Resolves with the device code to show the user, or rejects if the flow fails early
+  // (e.g. GitHub is unreachable or the client cancelled).
+  waitForDeviceCode(): Promise<CopilotDeviceCode>;
+
+  // Resolves once the user authorizes in their browser, or rejects if the attempt fails or
+  // times out.
+  wait(): Promise<CopilotLoginResult>;
+
+  // Abandon the attempt (stops polling for authorization).
+  cancel(): Promise<void>;
+}
+
+// Device-code step of a GitHub Copilot sign-in (see CopilotLoginAttempt).
+export type CopilotDeviceCode = {
+  // The code the user enters at the verification URI.
+  userCode: string;
+  // Where to enter the code (github.com/login/device for individual accounts).
+  verificationUri: string;
+  // Seconds before the code expires, when GitHub reported it.
+  expiresInSeconds?: number;
+};
+
+// Result of a completed GitHub Copilot sign-in. The credential itself is persisted
+// server-side on the account and never returned to the client.
+export type CopilotLoginResult = {
+  // Copilot model ids the account may use, when the API reported them; undefined when unknown.
+  availableModelIds?: string[];
+};
+
+// Whether this account has a stored GitHub Copilot sign-in, for UI bootstrapping
+// (see AuthenticatedApi.getCopilotLoginStatus()).
+export type CopilotLoginStatus = {
+  signedIn: boolean;
+  // Copilot model ids the signed-in account may use, when the API reported them.
+  availableModelIds?: string[];
+};
+
 // A pending gatekeeper sign-in attempt, returned by `PublicApi.startGatekeeperLogin()`. Holding this
 // stub is the capability to receive the resulting session token; dispose it to abandon the attempt.
 export interface LoginAttempt extends RpcTarget {
@@ -338,6 +379,22 @@ export interface AuthenticatedApi extends RpcTarget {
   // Adds a new model to the user's configured set. The ID must be unique among the user's
   // configured models.
   addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void>;
+
+  // Begin a GitHub Copilot sign-in (the same device-code flow the Copilot VS Code extension
+  // uses). Returns a stub whose `waitForDeviceCode()` yields the code the user must enter at
+  // the verification URI (github.com/login/device for individual accounts), and whose `wait()`
+  // resolves once they authorize. The credential is stored server-side on this account (see
+  // getCopilotLoginStatus()) and reused by every Copilot model — the device-flow token never
+  // crosses the RPC boundary. Call `cancel()` (or dispose the stub) to abandon the attempt.
+  startCopilotLogin(): Promise<RpcStub<CopilotLoginAttempt>>;
+
+  // Whether this account has a stored GitHub Copilot sign-in. When true, adding any Copilot
+  // model reuses it (no OAuth flow needed). The credential itself is never exposed.
+  getCopilotLoginStatus(): Promise<CopilotLoginStatus>;
+
+  // Remove the stored GitHub Copilot sign-in. Existing Copilot models keep working until
+  // GitHub revokes the token; adding new ones requires a fresh sign-in.
+  disconnectCopilotLogin(): Promise<void>;
 
   // Deletes a configured model.
   deleteModel(id: string): Promise<void>;
@@ -944,7 +1001,7 @@ export type CloudflareAccountOption = {
 };
 
 // Supported AI providers.
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "github-copilot";
 
 // Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`.
 export type AiGatewayInfo = {
@@ -962,7 +1019,10 @@ export type AiModelConfig = {
   // Name of the specific model, as specified to the provider's API.
   model: string;
 
-  // Secret API token for the respective provider, for billing purposes.
+  // Secret API token for the respective provider, for billing purposes. For provider
+  // "github-copilot" this is the stored device-flow sign-in token, filled in by the backend
+  // from the account's Copilot credential (see getCopilotLoginStatus()) — the client sends an
+  // empty string.
   apiToken: string;
 
   // Cloudflare account ID owning the Workers AI deployment the token authorizes. Required for
@@ -1009,6 +1069,13 @@ export const SUGGESTED_MODELS: Record<
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+  },
+  "github-copilot": {
+    "claude-sonnet-5": {name: "Claude Sonnet 5 (Copilot)", contextWindow: 1000000},
+    "claude-opus-5": {name: "Claude Opus 5 (Copilot)", contextWindow: 1000000},
+    "claude-haiku-4.5": {name: "Claude Haiku 4.5 (Copilot)", contextWindow: 200000},
+    "gpt-5.6-sol": {name: "GPT 5.6 Sol (Copilot)", contextWindow: 1050000},
+    "gemini-3.5-flash": {name: "Gemini 3.5 Flash (Copilot)", contextWindow: 200000},
   },
   "ollama": {
   },
